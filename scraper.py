@@ -140,12 +140,15 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
         if not bootstrap_body:
             raise RuntimeError("No bootstrapSession response captured")
 
+        logger.info("[VERBOSE] bootstrapSession response size: %d bytes", len(bootstrap_body))
+
         # Extract data strictly from bootstrap response body (not tsConfigContainer)
         dashboard_name = ""
         worksheet_names = []
         session_id = ""
         vizql_root = ""
         sheet_id = ""
+        datasources = []
 
         match = re.search(r"\d+;({.*})\d+;({.*})", bootstrap_body, re.MULTILINE)
         if match:
@@ -158,11 +161,40 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
             world = info.get("worldUpdate", {})
             app_pm = world.get("applicationPresModel", {})
             wb_pm = app_pm.get("workbookPresModel", {})
-            dash_pm = wb_pm.get("dashboardPresModel", {})
-            for vid in dash_pm.get("visualIds", []):
-                ws = vid.get("worksheet", "")
-                if ws and ws not in worksheet_names:
-                    worksheet_names.append(ws)
+            
+            # Extract worksheets from sheetsInfo
+            sheets_info = wb_pm.get("sheetsInfo", [])
+            for sheet in sheets_info:
+                if sheet.get("isDashboard") is False:
+                    ws_name = sheet.get("sheet", "")
+                    if ws_name and ws_name not in worksheet_names:
+                        worksheet_names.append(ws_name)
+            
+            # Fallback to visualIds if sheetsInfo is empty
+            if not worksheet_names:
+                dash_pm = wb_pm.get("dashboardPresModel", {})
+                for vid in dash_pm.get("visualIds", []):
+                    ws = vid.get("worksheet", "")
+                    if ws and ws not in worksheet_names:
+                        worksheet_names.append(ws)
+
+            # Try to extract datasources if present (older versions / secondaryInfo)
+            try:
+                secondary_info = json.loads(match.group(2))
+                dd_pm = secondary_info.get("secondaryInfo", {}).get("presModelMap", {}).get("dataDictionary", {}).get("presModelHolder", {}).get("genDataDictionaryPresModel", {})
+                if dd_pm:
+                    datasources = [ds.get("name", ds.get("id", ds)) for ds in dd_pm.get("dataSources", [])]
+            except Exception:
+                pass
+            
+            if not datasources:
+                dd_pm = wb_pm.get("dataDictionary", {})
+                if dd_pm:
+                    datasources = [ds.get("name", ds.get("id", ds)) for ds in dd_pm.get("dataSources", [])]
+
+            logger.info("[VERBOSE] Workbook Info: '%s'", dashboard_name)
+            logger.info("[VERBOSE] Extracted Worksheets (%d): %s", len(worksheet_names), worksheet_names)
+            logger.info("[VERBOSE] Extracted Datasources (%d): %s", len(datasources), datasources)
 
         if not session_id:
             # Extract from URL e.g. /bootstrapSession/sessions/F33...
@@ -181,18 +213,16 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
         logger.info("[VERBOSE] Extracted cookies: %s\n", cookies_dict.keys())
         
         if not jsessionid:
-            raise RuntimeError(
-                "Tableau Public failed to issue a JSESSIONID. This usually means "
-                "the server has temporarily rate-limited or blocked this IP from "
-                "creating new VizQL sessions due to anti-bot protections. "
-                "Please wait 10-15 minutes and try again."
-            )
+            logger.warning("[VERBOSE] JSESSIONID is missing from the browser cookies. This is expected behavior for modern Tableau Public deployments.")
 
         browser.close()
 
     # Reconstruct vizql_root correctly from the URL if missing
     if not vizql_root:
-        if vizql_version:
+        vizql_match = re.search(r"(/vizql/.*)/bootstrapSession", bootstrap_req["url"])
+        if vizql_match:
+            vizql_root = vizql_match.group(1)
+        elif vizql_version:
             vizql_root = f"/vizql/{vizql_version}"
         else:
             vizql_root = "/vizql/t/public/w/dashboard" # Fallback guess
@@ -229,8 +259,10 @@ def _get_summary_data(
         }))),
     )
 
+    logger.info("[VERBOSE] Executing VizQL command: get-summary-data for worksheet '%s'", worksheet_name)
     r = http.post(url, files=payload, timeout=60)
     r.raise_for_status()
+    logger.info("[VERBOSE] get-summary-data response size: %d bytes", len(r.content))
     resp = r.json()
 
     cmd = resp.get("vqlCmdResponse", {})
@@ -265,8 +297,10 @@ def _get_underlying_data(
         }))),
     )
 
+    logger.info("[VERBOSE] Executing VizQL command: get-underlying-data for worksheet '%s'", worksheet_name)
     r = http.post(url, files=payload, timeout=60)
     r.raise_for_status()
+    logger.info("[VERBOSE] get-underlying-data response size: %d bytes", len(r.content))
     resp = r.json()
 
     cmd = resp.get("vqlCmdResponse", {})
