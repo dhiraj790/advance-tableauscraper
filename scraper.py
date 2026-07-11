@@ -126,9 +126,8 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
         page.on("request", on_request)
         page.on("response", on_response)
 
-        logger.info("Loading viz page: %s", url)
-        # Wait until fully loaded and JS initializes
-        page.goto(url, wait_until="networkidle", timeout=60_000)
+        # Wait until DOM loaded, Tableau uses delayed JS XHRs so networkidle fires too early
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
         # Wait extra time for bootstrapSession if networkidle fired too early
         for _ in range(45):
@@ -167,8 +166,12 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
                     worksheet_names.append(ws)
 
         if not session_id:
-            logger.warning("Could not find sessionId in bootstrap info. Fallback to parsing URL or tsConfig")
-            # Fallback if needed but instructions said extract from it. We'll try.
+            # Extract from URL e.g. /bootstrapSession/sessions/F33...
+            sess_match = re.search(r"/sessions/([^/]+)", bootstrap_req["url"])
+            if sess_match:
+                session_id = sess_match.group(1)
+            else:
+                logger.warning("Could not find sessionId in bootstrap info or URL.")
 
         browser_cookies = context.cookies()
         cookies_dict = {c["name"]: c["value"] for c in browser_cookies}
@@ -344,9 +347,11 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
 
     worksheets: dict[str, pd.DataFrame] = {}
 
-    if not proxy_server:
+    if proxy_server is None:
         print("Using default paid proxy...")
         proxy_server = PAID_PROXY
+    elif proxy_server == "None":
+        proxy_server = None
 
     max_attempts = 3
     boot = None
