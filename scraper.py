@@ -249,18 +249,18 @@ def _get_summary_data(
     max_rows: int = 10000,
 ) -> pd.DataFrame:
     url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-summary-data"
-    payload = {
-        "maxRows": str(max_rows),
-        "visualIdPresModel": json.dumps({
+    payload = (
+        ("maxRows", (None, str(max_rows))),
+        ("visualIdPresModel", (None, json.dumps({
             "worksheet": worksheet_name,
             "dashboard": dashboard_name,
             "flipboardZoneId": 0,
             "storyPointId": 0,
-        }),
-    }
+        }))),
+    )
 
     logger.info("[VERBOSE] Executing VizQL command: get-summary-data for worksheet '%s'", worksheet_name)
-    r = http.post(url, data=payload, timeout=60)
+    r = http.post(url, files=payload, timeout=60)
     r.raise_for_status()
     logger.info("[VERBOSE] get-summary-data response size: %d bytes", len(r.content))
     resp = r.json()
@@ -286,19 +286,19 @@ def _get_underlying_data(
     max_rows: int = 10000,
 ) -> pd.DataFrame:
     url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-underlying-data"
-    payload = {
-        "maxRows": str(max_rows),
-        "includeAllColumns": "true",
-        "visualIdPresModel": json.dumps({
+    payload = (
+        ("maxRows", (None, str(max_rows))),
+        ("includeAllColumns", (None, "true")),
+        ("visualIdPresModel", (None, json.dumps({
             "worksheet": worksheet_name,
             "dashboard": dashboard_name,
             "flipboardZoneId": 0,
             "storyPointId": 0,
-        }),
-    }
+        }))),
+    )
 
     logger.info("[VERBOSE] Executing VizQL command: get-underlying-data for worksheet '%s'", worksheet_name)
-    r = http.post(url, data=payload, timeout=60)
+    r = http.post(url, files=payload, timeout=60)
     r.raise_for_status()
     logger.info("[VERBOSE] get-underlying-data response size: %d bytes", len(r.content))
     resp = r.json()
@@ -451,6 +451,17 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
         # Add Referer and Origin headers required by Tableau
         http.headers["Referer"] = url
         http.headers["Origin"] = host
+
+        # Re-bootstrap from our requests session so the server associates
+        # the VizQL commands with this specific client (not just the browser)
+        bs_url = f"{host}{vizql_root}/bootstrapSession/sessions/{session_id}"
+        bs_payload = {
+            "sheet_id": active_tab,
+            "clientDimension": json.dumps({"w": 1920, "h": 1080}),
+        }
+        logger.info("[VERBOSE] Bootstrapping session from requests session...")
+        bs_resp = http.post(bs_url, data=bs_payload, timeout=30)
+        logger.info("[VERBOSE] Bootstrap POST status: %d / %d bytes", bs_resp.status_code, len(bs_resp.content))
 
         for ws_name in ws_names:
             try:
