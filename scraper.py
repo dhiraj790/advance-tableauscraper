@@ -92,9 +92,16 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
         
         page = context.new_page()
 
-        def on_request(request):
-            nonlocal bootstrap_req
-            if "bootstrapSession" in request.url and bootstrap_req is None:
+        def handle_route(route):
+            nonlocal bootstrap_req, bootstrap_body, vizql_version
+            request = route.request
+            
+            if not vizql_version:
+                ver_match = re.search(r"/vizql/(v_[^/]+)/", request.url)
+                if ver_match:
+                    vizql_version = ver_match.group(1)
+
+            if bootstrap_req is None:
                 bootstrap_req = {
                     "url": request.url,
                     "method": request.method,
@@ -106,25 +113,19 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
                 logger.info("Headers: %s", json.dumps(request.headers, indent=2))
                 logger.info("POST Body: %s\n", request.post_data)
 
-        def on_response(response):
-            nonlocal bootstrap_body, vizql_version, bootstrap_resp
-            resp_url = response.url
-            if not vizql_version:
-                ver_match = re.search(r"/vizql/(v_[^/]+)/", resp_url)
-                if ver_match:
-                    vizql_version = ver_match.group(1)
+            try:
+                response = route.fetch()
+                logger.info("\n[VERBOSE] Captured bootstrapSession Response Status: %s", response.status)
+                body = response.text()
+                if len(body) > len(bootstrap_body):
+                    bootstrap_body = body
+                route.fulfill(response=response)
+            except Exception as e:
+                logger.error("Failed to read bootstrap response via route: %s", e)
+                # Fallback to let the page continue if fetch fails
+                route.fallback()
 
-            if "bootstrapSession" in resp_url and response.status == 200:
-                try:
-                    logger.info("\n[VERBOSE] Captured bootstrapSession Response Status: %s", response.status)
-                    body = response.text()
-                    if len(body) > len(bootstrap_body):
-                        bootstrap_body = body
-                except Exception as e:
-                    logger.error("Failed to read bootstrap response: %s", e)
-
-        page.on("request", on_request)
-        page.on("response", on_response)
+        page.route(re.compile(r"bootstrapSession"), handle_route)
 
         # Wait until DOM loaded, Tableau uses delayed JS XHRs so networkidle fires too early
         page.goto(url, wait_until="domcontentloaded", timeout=60_000)
@@ -138,8 +139,6 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
 
         if not bootstrap_body:
             raise RuntimeError("No bootstrapSession response captured")
-        if not bootstrap_req:
-            raise RuntimeError("No bootstrapSession request captured")
 
         # Extract data strictly from bootstrap response body (not tsConfigContainer)
         dashboard_name = ""
