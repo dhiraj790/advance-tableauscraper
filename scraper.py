@@ -69,6 +69,34 @@ def _parse_bootstrap_body(body: str) -> tuple[dict, dict, list[str]]:
     return info, secondary, ws_names
 
 
+def _extract_data_from_bootstrap(secondary: dict) -> dict[str, pd.DataFrame]:
+    """Try to extract worksheet data from the bootstrap response's data dictionary."""
+    import pandas as pd
+    result = {}
+    try:
+        dd_pm = secondary.get("secondaryInfo", {}).get("presModelMap", {}).get("dataDictionary", {}).get("presModelHolder", {}).get("genDataDictionaryPresModel", {})
+        data_segments = dd_pm.get("dataSegments", {})
+        logger.info("[VERBOSE] Bootstrap dataSegments keys: %s", list(data_segments.keys()))
+        for seg_name, seg_data in data_segments.items():
+            columns = []
+            rows_data = {}
+            data_columns = seg_data.get("dataColumns", [])
+            logger.info("[VERBOSE] Segment '%s' has %d columns", seg_name, len(data_columns))
+            for col in data_columns:
+                col_name = col.get("fieldCaption", col.get("fieldName", col.get("id", "?")))
+                columns.append(col_name)
+                col_values = col.get("dataValues", [])
+                rows_data[col_name] = col_values
+            if columns and rows_data:
+                df = pd.DataFrame(rows_data)
+                if not df.empty:
+                    result[seg_name] = df
+                    logger.info("[VERBOSE] Extracted %d rows x %d cols from segment '%s'", len(df), len(df.columns), seg_name)
+    except Exception as exc:
+        logger.warning("Failed to extract data from bootstrap: %s", exc)
+    return result
+
+
 def _vizql_via_page(page, url: str, payload_json: str, max_rows: str, extra_fields: dict | None = None) -> dict:
     """Make a VizQL command POST via the browser's native fetch API.
     
@@ -267,7 +295,7 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
             else:
                 vizql_root = "/vizql/w/_17255232362800/v/sheet11"
 
-        info, _, ws_names = _parse_bootstrap_body(bootstrap_body)
+        info, secondary_info, ws_names = _parse_bootstrap_body(bootstrap_body)
         dashboard_name = info.get("sheetName", "")
         session_id = info.get("sessionId", session_id)
         vizql_root = info.get("vizql_root", vizql_root)
@@ -319,6 +347,16 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
                 logger.warning("Failed to extract '%s': %s", ws_name, exc)
 
         browser.close()
+
+    if not worksheets:
+        logger.info("[VERBOSE] VizQL commands returned no data, trying bootstrap data extraction...")
+        logger.info("[VERBOSE] Secondary top keys: %s", list(secondary_info.keys()))
+        pm = secondary_info.get("secondaryInfo", {}).get("presModelMap", {})
+        logger.info("[VERBOSE] presModelMap keys: %s", list(pm.keys()))
+        bs_data = _extract_data_from_bootstrap(secondary_info)
+        for seg_name, df in bs_data.items():
+            worksheets[seg_name] = df
+            logger.info("Extracted bootstrap segment '%s': %d rows x %d cols", seg_name, len(df), len(df.columns))
 
     if not worksheets:
         raise RuntimeError("No worksheet data could be extracted.")
