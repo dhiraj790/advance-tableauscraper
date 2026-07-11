@@ -249,18 +249,18 @@ def _get_summary_data(
     max_rows: int = 10000,
 ) -> pd.DataFrame:
     url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-summary-data"
-    payload = (
-        ("maxRows", (None, str(max_rows))),
-        ("visualIdPresModel", (None, json.dumps({
+    payload = {
+        "maxRows": str(max_rows),
+        "visualIdPresModel": json.dumps({
             "worksheet": worksheet_name,
             "dashboard": dashboard_name,
             "flipboardZoneId": 0,
             "storyPointId": 0,
-        }))),
-    )
+        }),
+    }
 
     logger.info("[VERBOSE] Executing VizQL command: get-summary-data for worksheet '%s'", worksheet_name)
-    r = http.post(url, files=payload, timeout=60)
+    r = http.post(url, data=payload, timeout=60)
     r.raise_for_status()
     logger.info("[VERBOSE] get-summary-data response size: %d bytes", len(r.content))
     resp = r.json()
@@ -286,19 +286,19 @@ def _get_underlying_data(
     max_rows: int = 10000,
 ) -> pd.DataFrame:
     url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-underlying-data"
-    payload = (
-        ("maxRows", (None, str(max_rows))),
-        ("includeAllColumns", (None, "true")),
-        ("visualIdPresModel", (None, json.dumps({
+    payload = {
+        "maxRows": str(max_rows),
+        "includeAllColumns": "true",
+        "visualIdPresModel": json.dumps({
             "worksheet": worksheet_name,
             "dashboard": dashboard_name,
             "flipboardZoneId": 0,
             "storyPointId": 0,
-        }))),
-    )
+        }),
+    }
 
     logger.info("[VERBOSE] Executing VizQL command: get-underlying-data for worksheet '%s'", worksheet_name)
-    r = http.post(url, files=payload, timeout=60)
+    r = http.post(url, data=payload, timeout=60)
     r.raise_for_status()
     logger.info("[VERBOSE] get-underlying-data response size: %d bytes", len(r.content))
     resp = r.json()
@@ -425,7 +425,11 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
                 "http": proxy_server,
                 "https": proxy_server,
             })
-        http.cookies.update(cookies)
+        
+        # Set cookies with proper domain so requests actually sends them
+        cookie_domain = ".public.tableau.com"
+        for name, value in cookies.items():
+            http.cookies.set(name, value, domain=cookie_domain, path="/")
         
         # Filter browser headers to avoid breaking python requests
         safe_headers = {}
@@ -438,6 +442,15 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
             "Accept": "application/json, text/javascript, */*",
             "X-Tsi-Active-Tab": active_tab,
         })
+        
+        # Add XSRF token if present in cookies
+        xsrf_token = cookies.get("XSRF-TOKEN") or cookies.get("xsrf-token")
+        if xsrf_token:
+            http.headers["X-XSRF-TOKEN"] = xsrf_token
+        
+        # Add Referer and Origin headers required by Tableau
+        http.headers["Referer"] = url
+        http.headers["Origin"] = host
 
         for ws_name in ws_names:
             try:
