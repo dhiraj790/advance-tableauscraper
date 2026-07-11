@@ -69,31 +69,36 @@ def _parse_bootstrap_body(body: str) -> tuple[dict, dict, list[str]]:
     return info, secondary, ws_names
 
 
-def _vizql_summary_data(
-    ctx, host: str, vizql_root: str, session_id: str,
-    ws_name: str, dashboard_name: str,
-    max_rows: int = 10000,
-) -> pd.DataFrame:
-    url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-summary-data"
-    visual_json = json.dumps({
-        "worksheet": ws_name,
-        "dashboard": dashboard_name,
-        "flipboardZoneId": 0,
-        "storyPointId": 0,
-    })
-    logger.info("[VERBOSE] VizQL get-summary-data for '%s'", ws_name)
-    resp = ctx.request.post(url, multipart={
-        "maxRows": str(max_rows),
-        "visualIdPresModel": {
-            "name": "blob",
-            "mimeType": "application/octet-stream",
-            "buffer": visual_json.encode("utf-8"),
-        },
-    })
-    if resp.status != 200:
-        logger.warning("get-summary-data status %d for '%s'", resp.status, ws_name)
+def _vizql_via_page(page, url: str, payload_json: str, max_rows: str) -> dict:
+    """Make a VizQL command POST via the browser's native fetch API.
+    
+    Uses FormData + Blob exactly as Tableau's own JavaScript does,
+    so cookies, headers, and session are all handled by the browser.
+    """
+    result = page.evaluate("""
+        async ([url, maxRows, visualJson]) => {
+            const form = new FormData();
+            form.append('maxRows', maxRows);
+            const blob = new Blob([visualJson], {type: 'application/octet-stream'});
+            form.append('visualIdPresModel', blob, 'blob');
+            try {
+                const r = await fetch(url, {method: 'POST', body: form});
+                return {status: r.status, body: await r.text()};
+            } catch (e) {
+                return {status: 0, body: e.message || 'fetch failed'};
+            }
+        }
+    """, [url, max_rows, payload_json])
+    return result
+
+
+def _parse_vizql_response(resp: dict) -> pd.DataFrame:
+    if resp.get("status") != 200:
         return pd.DataFrame()
-    data = resp.json()
+    try:
+        data = json.loads(resp["body"])
+    except (json.JSONDecodeError, KeyError):
+        return pd.DataFrame()
     cmd = data.get("vqlCmdResponse", {})
     for result in cmd.get("cmdResultList", []):
         cr = result.get("commandReturn", {})
@@ -107,32 +112,13 @@ def _vizql_summary_data(
     return pd.DataFrame()
 
 
-def _vizql_underlying_data(
-    ctx, host: str, vizql_root: str, session_id: str,
-    ws_name: str, dashboard_name: str,
-    max_rows: int = 10000,
-) -> pd.DataFrame:
-    url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-underlying-data"
-    visual_json = json.dumps({
-        "worksheet": ws_name,
-        "dashboard": dashboard_name,
-        "flipboardZoneId": 0,
-        "storyPointId": 0,
-    })
-    logger.info("[VERBOSE] VizQL get-underlying-data for '%s'", ws_name)
-    resp = ctx.request.post(url, multipart={
-        "maxRows": str(max_rows),
-        "includeAllColumns": "true",
-        "visualIdPresModel": {
-            "name": "blob",
-            "mimeType": "application/octet-stream",
-            "buffer": visual_json.encode("utf-8"),
-        },
-    })
-    if resp.status != 200:
-        logger.warning("get-underlying-data status %d for '%s'", resp.status, ws_name)
+def _parse_vizql_underlying_response(resp: dict) -> pd.DataFrame:
+    if resp.get("status") != 200:
         return pd.DataFrame()
-    data = resp.json()
+    try:
+        data = json.loads(resp["body"])
+    except (json.JSONDecodeError, KeyError):
+        return pd.DataFrame()
     cmd = data.get("vqlCmdResponse", {})
     for result in cmd.get("cmdResultList", []):
         cr = result.get("commandReturn", {})
@@ -295,9 +281,27 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
 
         for ws_name in ws_names:
             try:
-                df = _vizql_summary_data(context, host, vizql_root, session_id, ws_name, dashboard_name)
+                summary_url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-summary-data"
+                summary_payload = json.dumps({
+                    "worksheet": ws_name,
+                    "dashboard": dashboard_name,
+                    "flipboardZoneId": 0,
+                    "storyPointId": 0,
+                })
+                logger.info("[VERBOSE] get-summary-data for '%s'", ws_name)
+                resp = _vizql_via_page(page, summary_url, summary_payload, str(10000))
+                df = _parse_vizql_response(resp)
                 if df.empty:
-                    df = _vizql_underlying_data(context, host, vizql_root, session_id, ws_name, dashboard_name)
+                    under_url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-underlying-data"
+                    under_payload = json.dumps({
+                        "worksheet": ws_name,
+                        "dashboard": dashboard_name,
+                        "flipboardZoneId": 0,
+                        "storyPointId": 0,
+                    })
+                    logger.info("[VERBOSE] get-underlying-data for '%s'", ws_name)
+                    resp = _vizql_via_page(page, under_url, under_payload, str(10000))
+                    df = _parse_vizql_underlying_response(resp)
                 if not df.empty:
                     worksheets[ws_name] = df
                     logger.info("Extracted '%s': %d rows x %d cols", ws_name, len(df), len(df.columns))
