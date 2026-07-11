@@ -1,0 +1,15 @@
+{
+    "title": "Tableau Scraper Input",
+    "type": "object",
+    "schemaVersion": 1,
+    "properties": {
+        "url": {
+            "title": "Tableau Public URL",
+            "type": "string",
+            "description": "The URL of the Tableau Public dashboard you want to scrape.",
+            "editor": "textfield",
+            "prefill": "https://public.tableau.com/views/_17255232362800/sheet11?:showVizHome=no"
+        }
+    },
+    "required": ["url"]
+}

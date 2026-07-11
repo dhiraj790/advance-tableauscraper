@@ -1,0 +1,421 @@
+"""Tableau Public scraper – production version.
+
+Uses Playwright to bootstrap the VizQL session (needed for thin-client vizzes),
+then calls the REAL Tableau VizQL `get-summary-data` command using `requests`
+to extract data from every worksheet.
+
+Architecture:
+  1. Playwright loads the viz page, captures bootstrap response + cookies.
+     (Uses basic stealth to avoid bot detection that strips JSESSIONID)
+  2. The versioned vizql_root is extracted from the network traffic.
+  3. A plain `requests.Session` reuses those cookies and includes the 
+     required `X-Tsi-Active-Tab` header to call VizQL commands.
+  4. Data is extracted via `get-summary-data` (real VizQL API).
+  5. Results are exported to CSV files + sample.csv.
+
+All endpoints are REAL Tableau VizQL commands — nothing fabricated.
+"""
+from __future__ import annotations
+
+import io
+import json
+import logging
+import random
+import re
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+import pandas as pd
+import requests
+from playwright.sync_api import sync_playwright
+
+from config import OUTPUT_DIR, SAMPLE_CSV, URL
+
+logger = logging.getLogger("tableau_scraper")
+
+PAID_PROXY = 'http://groups-RESIDENTIAL:<APIFY_PROXY_PASSWORD>@proxy.apify.com:8000'
+# ── Keywords for address-level worksheet detection ──────────────────
+ADDRESS_KEYWORDS = [
+    "address", "street", "road", "city", "zip", "postal",
+    "lat", "lon", "longitude", "latitude",
+    "\u05db\u05ea\u05d5\u05d1\u05ea",  # כתובת
+    "\u05e8\u05d7\u05d5\u05d1",        # רחוב
+    "\u05e2\u05d9\u05e8",              # עיר
+    "\u05e1\u05e4\u05e7",              # ספק
+]
+
+
+def _is_address_worksheet(df: pd.DataFrame) -> bool:
+    if df.empty:
+        return False
+    cols_lower = [str(c).lower() for c in df.columns]
+    return any(kw in col for col in cols_lower for kw in ADDRESS_KEYWORDS)
+
+
+# ────────────────────────────────────────────────────────────────────
+#  Core: Playwright bootstrap + requests API
+# ────────────────────────────────────────────────────────────────────
+
+def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
+    bootstrap_body: str = ""
+    vizql_version: str = ""
+    ts_config: dict = {}
+    cookies_dict: dict[str, str] = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context_args = {
+            "viewport": {"width": 1920, "height": 1080},
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        }
+        if proxy_server:
+            parsed = urlparse(proxy_server)
+            if parsed.username and parsed.password:
+                context_args["proxy"] = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                    "username": parsed.username,
+                    "password": parsed.password,
+                }
+            else:
+                context_args["proxy"] = {"server": proxy_server}
+            
+        context = browser.new_context(**context_args)
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+        
+        page = context.new_page()
+
+        def on_response(response):
+            nonlocal bootstrap_body, vizql_version
+            resp_url = response.url
+            if not vizql_version:
+                ver_match = re.search(r"/vizql/(v_[^/]+)/", resp_url)
+                if ver_match:
+                    vizql_version = ver_match.group(1)
+
+            if "bootstrapSession" in resp_url and response.status == 200:
+                try:
+                    body = response.text()
+                    if len(body) > len(bootstrap_body):
+                        bootstrap_body = body
+                except Exception:
+                    pass
+
+        page.on("response", on_response)
+
+        logger.info("Loading viz page: %s", url)
+        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+        for _ in range(45):
+            page.wait_for_timeout(1000)
+            if bootstrap_body:
+                page.wait_for_timeout(3000)
+                break
+
+        if not bootstrap_body:
+            raise RuntimeError("No bootstrapSession response captured")
+
+        raw = page.evaluate("""
+            () => {
+                const el = document.getElementById('tsConfigContainer');
+                return el ? (el.value || el.textContent || '') : '';
+            }
+        """)
+        ts_config = json.loads(raw) if raw and raw.strip() else {}
+
+        if not ts_config:
+            raise RuntimeError("tsConfigContainer is empty")
+
+        vizql_root = ts_config.get("vizql_root", "")
+        session_id = ts_config.get("sessionid", "")
+        active_tab = ts_config.get("sheetId", "")
+
+        if vizql_version and f"/{vizql_version}/" not in vizql_root:
+            vizql_root = vizql_root.replace("/vizql/", f"/vizql/{vizql_version}/", 1)
+
+        worksheet_names: list[str] = []
+        dashboard_name: str = ""
+
+        match = re.search(r"\d+;({.*})\d+;({.*})", bootstrap_body, re.MULTILINE)
+        if match:
+            info = json.loads(match.group(1))
+            dashboard_name = info.get("sheetName", "")
+            world = info.get("worldUpdate", {})
+            app_pm = world.get("applicationPresModel", {})
+            wb_pm = app_pm.get("workbookPresModel", {})
+            dash_pm = wb_pm.get("dashboardPresModel", {})
+            for vid in dash_pm.get("visualIds", []):
+                ws = vid.get("worksheet", "")
+                if ws and ws not in worksheet_names:
+                    worksheet_names.append(ws)
+
+        if not dashboard_name:
+            dashboard_name = active_tab
+
+        browser_cookies = context.cookies()
+        cookies_dict = {c["name"]: c["value"] for c in browser_cookies}
+        
+        if "JSESSIONID" not in cookies_dict:
+            raise RuntimeError(
+                "Tableau Public failed to issue a JSESSIONID. This usually means "
+                "the server has temporarily rate-limited or blocked this IP from "
+                "creating new VizQL sessions due to anti-bot protections. "
+                "Please wait 10-15 minutes and try again."
+            )
+
+        browser.close()
+
+    uri = urlparse(url)
+    host = f"{uri.scheme}://{uri.netloc}"
+
+    return {
+        "host": host,
+        "vizql_root": vizql_root,
+        "session_id": session_id,
+        "dashboard_name": dashboard_name,
+        "worksheet_names": worksheet_names,
+        "cookies": cookies_dict,
+        "active_tab": active_tab,
+    }
+
+
+def _get_summary_data(
+    host: str, vizql_root: str, session_id: str,
+    http: requests.Session,
+    worksheet_name: str, dashboard_name: str,
+    max_rows: int = 10000,
+) -> pd.DataFrame:
+    url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-summary-data"
+    payload = (
+        ("maxRows", (None, str(max_rows))),
+        ("visualIdPresModel", (None, json.dumps({
+            "worksheet": worksheet_name,
+            "dashboard": dashboard_name,
+            "flipboardZoneId": 0,
+            "storyPointId": 0,
+        }))),
+    )
+
+    r = http.post(url, files=payload, timeout=60)
+    r.raise_for_status()
+    resp = r.json()
+
+    cmd = resp.get("vqlCmdResponse", {})
+    for result in cmd.get("cmdResultList", []):
+        cr = result.get("commandReturn", {})
+        sdt = cr.get("summaryDataTable", {})
+        if sdt:
+            columns = [col.get("fieldCaption", f"col_{i}")
+                       for i, col in enumerate(sdt.get("columns", []))]
+            data_rows = sdt.get("data", [])
+            if columns and data_rows:
+                return pd.DataFrame(data_rows, columns=columns)
+
+    return pd.DataFrame()
+
+
+def _get_underlying_data(
+    host: str, vizql_root: str, session_id: str,
+    http: requests.Session,
+    worksheet_name: str, dashboard_name: str,
+    max_rows: int = 10000,
+) -> pd.DataFrame:
+    url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-underlying-data"
+    payload = (
+        ("maxRows", (None, str(max_rows))),
+        ("includeAllColumns", (None, "true")),
+        ("visualIdPresModel", (None, json.dumps({
+            "worksheet": worksheet_name,
+            "dashboard": dashboard_name,
+            "flipboardZoneId": 0,
+            "storyPointId": 0,
+        }))),
+    )
+
+    r = http.post(url, files=payload, timeout=60)
+    r.raise_for_status()
+    resp = r.json()
+
+    cmd = resp.get("vqlCmdResponse", {})
+    for result in cmd.get("cmdResultList", []):
+        cr = result.get("commandReturn", {})
+        for key in ("underlyingDataTable", "summaryDataTable"):
+            sdt = cr.get(key, {})
+            if sdt:
+                columns = [col.get("fieldCaption", f"col_{i}")
+                           for i, col in enumerate(sdt.get("columns", []))]
+                data_rows = sdt.get("data", [])
+                if columns and data_rows:
+                    return pd.DataFrame(data_rows, columns=columns)
+
+    return pd.DataFrame()
+
+
+# ────────────────────────────────────────────────────────────────────
+#  Address worksheet detection
+# ────────────────────────────────────────────────────────────────────
+
+def detect_address_worksheet(
+    worksheets: dict[str, pd.DataFrame],
+) -> tuple[str, pd.DataFrame] | None:
+    candidates = [
+        (name, df)
+        for name, df in worksheets.items()
+        if _is_address_worksheet(df)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda pair: len(pair[1]), reverse=True)
+    return candidates[0]
+
+
+# ────────────────────────────────────────────────────────────────────
+#  Export
+# ────────────────────────────────────────────────────────────────────
+
+def export_worksheets(worksheets: dict[str, pd.DataFrame]) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for name, df in worksheets.items():
+        safe = "".join(c if c.isalnum() or c in "._- " else "_" for c in name)
+        path = OUTPUT_DIR / f"{safe}.csv"
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+        logger.info("Exported '%s' -> %s (%d rows)", name, path, len(df))
+
+
+def save_sample(df: pd.DataFrame, path: Path = SAMPLE_CSV, n: int = 20) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sample = df.head(n)
+    sample.to_csv(path, index=False, encoding="utf-8-sig")
+    logger.info("Saved %d-row sample -> %s", len(sample), path)
+
+
+# ────────────────────────────────────────────────────────────────────
+#  Public entry point
+# ────────────────────────────────────────────────────────────────────
+
+def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, dict[str, pd.DataFrame]]:
+    """End-to-end scrape: connect -> list -> extract -> export -> sample."""
+
+    if sys.platform == "win32":
+        try:
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace"
+            )
+        except Exception:
+            pass
+
+    worksheets: dict[str, pd.DataFrame] = {}
+
+    if not proxy_server:
+        print("Using default paid proxy...")
+        proxy_server = PAID_PROXY
+
+    max_attempts = 3
+    boot = None
+
+    print("Using Playwright + VizQL commands to load Tableau dashboard...\n")
+
+    try:
+        for attempt in range(max_attempts):
+            if proxy_server:
+                print(f"[Attempt {attempt+1}/{max_attempts}] Using proxy: {proxy_server}")
+
+            try:
+                boot = _bootstrap_via_playwright(url, proxy_server)
+                break  # Success
+            except Exception as e:
+                logger.warning("Bootstrap failed on attempt %d: %s", attempt+1, e)
+                if attempt == max_attempts - 1:
+                    raise RuntimeError(f"Failed to bootstrap after {max_attempts} attempts: {e}")
+                print("Proxy/connection failed. Retrying...\n")
+
+        host = boot["host"]
+        vizql_root = boot["vizql_root"]
+        session_id = boot["session_id"]
+        dashboard_name = boot["dashboard_name"]
+        ws_names = boot["worksheet_names"]
+        cookies = boot["cookies"]
+        active_tab = boot["active_tab"]
+
+        print(f"Dashboard: {dashboard_name}")
+        print(f"VizQL root: {vizql_root}")
+        print(f"Session: {session_id}")
+        print(f"Worksheets: {ws_names}")
+        print(f"Cookies: {list(cookies.keys())}")
+
+        http = requests.Session()
+        if proxy_server:
+            http.proxies.update({
+                "http": proxy_server,
+                "https": proxy_server,
+            })
+        http.cookies.update(cookies)
+        http.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*",
+            "X-Tsi-Active-Tab": active_tab,
+        })
+
+        for ws_name in ws_names:
+            try:
+                df = _get_summary_data(
+                    host, vizql_root, session_id, http, ws_name, dashboard_name
+                )
+                if df.empty:
+                    df = _get_underlying_data(
+                        host, vizql_root, session_id, http, ws_name, dashboard_name
+                    )
+                if not df.empty:
+                    worksheets[ws_name] = df
+                    logger.info("Extracted '%s': %d rows x %d cols",
+                                ws_name, len(df), len(df.columns))
+                else:
+                    logger.warning("Worksheet '%s': no data returned", ws_name)
+            except Exception as exc:
+                logger.warning("Failed to extract '%s': %s", ws_name, exc)
+    except Exception as e:
+        raise RuntimeError(f"Scraper failed: {e}")
+
+    if not worksheets:
+        raise RuntimeError("No worksheet data could be extracted.")
+
+    # ── 3. Print worksheets ──
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print(f"Found {len(worksheets)} worksheet(s) with data:")
+    for i, name in enumerate(sorted(worksheets.keys()), 1):
+        df = worksheets[name]
+        print(f"  {i}. {name}  ({len(df)} rows x {len(df.columns)} cols)")
+    print(sep)
+
+    # ── 4. Print columns ──
+    for name, df in worksheets.items():
+        print(f"\n-- Worksheet: {name} --")
+        print(f"   Columns: {list(df.columns)}")
+
+    # ── 5. Export all worksheets ──
+    export_worksheets(worksheets)
+
+    # ── 6. Detect address-level worksheet ──
+    best: pd.DataFrame
+    match = detect_address_worksheet(worksheets)
+    if match:
+        best_name, best = match
+        print(f"\n[OK] Address-level data detected in: '{best_name}'")
+    else:
+        best_name = max(worksheets, key=lambda k: len(worksheets[k]))
+        best = worksheets[best_name]
+        print(f"\n[!] No address columns detected; using largest: '{best_name}'")
+
+    # ── 7. Save sample.csv ──
+    save_sample(best)
+    print(f"\n[OK] sample.csv saved ({min(20, len(best))} rows)")
+
+    return best, worksheets

@@ -1,0 +1,12 @@
+{
+    "actorSpecification": 1,
+    "name": "tableau-scraper",
+    "title": "Tableau Public Scraper",
+    "description": "Scrapes data from Tableau Public dashboards using VizQL.",
+    "version": "1.0.0",
+    "meta": {
+        "templateId": "python-playwright"
+    },
+    "input": "./input_schema.json",
+    "dockerfile": "./Dockerfile"
+}
