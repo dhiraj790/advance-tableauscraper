@@ -69,16 +69,20 @@ def _parse_bootstrap_body(body: str) -> tuple[dict, dict, list[str]]:
     return info, secondary, ws_names
 
 
-def _vizql_via_page(page, url: str, payload_json: str, max_rows: str) -> dict:
+def _vizql_via_page(page, url: str, payload_json: str, max_rows: str, extra_fields: dict | None = None) -> dict:
     """Make a VizQL command POST via the browser's native fetch API.
     
     Uses FormData + Blob exactly as Tableau's own JavaScript does,
     so cookies, headers, and session are all handled by the browser.
     """
+    extra_json = json.dumps(extra_fields or {})
     result = page.evaluate("""
-        async ([url, maxRows, visualJson]) => {
+        async ([url, maxRows, visualJson, extraJson]) => {
             const form = new FormData();
             form.append('maxRows', maxRows);
+            for (const [k, v] of Object.entries(JSON.parse(extraJson))) {
+                form.append(k, v);
+            }
             const blob = new Blob([visualJson], {type: 'application/octet-stream'});
             form.append('visualIdPresModel', blob, 'blob');
             try {
@@ -88,7 +92,7 @@ def _vizql_via_page(page, url: str, payload_json: str, max_rows: str) -> dict:
                 return {status: 0, body: e.message || 'fetch failed'};
             }
         }
-    """, [url, max_rows, payload_json])
+    """, [url, max_rows, payload_json, extra_json])
     return result
 
 
@@ -290,6 +294,8 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
                 })
                 logger.info("[VERBOSE] get-summary-data for '%s'", ws_name)
                 resp = _vizql_via_page(page, summary_url, summary_payload, str(10000))
+                if ws_name == ws_names[0]:
+                    logger.info("[VERBOSE] summary response status=%s, body=%.500s", resp.get("status"), resp.get("body", ""))
                 df = _parse_vizql_response(resp)
                 if df.empty:
                     under_url = f"{host}{vizql_root}/sessions/{session_id}/commands/tabdoc/get-underlying-data"
@@ -300,7 +306,9 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
                         "storyPointId": 0,
                     })
                     logger.info("[VERBOSE] get-underlying-data for '%s'", ws_name)
-                    resp = _vizql_via_page(page, under_url, under_payload, str(10000))
+                    resp = _vizql_via_page(page, under_url, under_payload, str(10000), {"includeAllColumns": "true"})
+                    if ws_name == ws_names[0]:
+                        logger.info("[VERBOSE] underlying response status=%s, body=%.500s", resp.get("status"), resp.get("body", ""))
                     df = _parse_vizql_underlying_response(resp)
                 if not df.empty:
                     worksheets[ws_name] = df
