@@ -1,16 +1,22 @@
 """Tableau Public scraper – production version.
 
-Uses the same approach as the tableauscraper library:
-  1. requests.Session GETs the HTML page
-  2. Extract tsConfigContainer from the HTML (pre-bootstrap session info)
-  3. POST bootstrapSession to activate the session from this client
-  4. POST VizQL commands (get-summary-data / get-underlying-data) 
+Hybrid approach:
+  1. Playwright loads the page, intercepts bootstrapSession requests
+  2. ABORTs the browser's bootstrap (so session is not activated by browser)
+  3. Extracts session ID from the intercepted request URL
+  4. Extracts cookies from the Playwright context
+  5. Closes the browser
+  6. Uses requests.Session with extracted cookies to bootstrap the session
+  7. Then POSTs VizQL commands (get-summary-data / get-underlying-data)
      to extract data from every worksheet
-  5. Results are exported to CSV files + sample.csv
+  8. Results are exported to CSV files + sample.csv
+
+This ensures the bootstrap and VizQL commands come from the same client
+(requests.Session), while still getting the pre-bootstrap session ID
+from the Playwright browser context.
 """
 from __future__ import annotations
 
-import html
 import io
 import json
 import logging
@@ -21,6 +27,7 @@ from urllib.parse import urlparse, urlencode
 
 import pandas as pd
 import requests
+from playwright.sync_api import sync_playwright
 
 from config import OUTPUT_DIR, SAMPLE_CSV, URL
 
@@ -42,26 +49,6 @@ def _is_address_worksheet(df: pd.DataFrame) -> bool:
         return False
     cols_lower = [str(c).lower() for c in df.columns]
     return any(kw in col for col in cols_lower for kw in ADDRESS_KEYWORDS)
-
-
-def _extract_ts_config(html_text: str) -> dict:
-    match = re.search(
-        r'<textarea[^>]*id=["\']tsConfigContainer["\'][^>]*>(.*?)</textarea>',
-        html_text, re.DOTALL | re.IGNORECASE
-    )
-    if not match:
-        logger.warning("tsConfigContainer not found in HTML, first 2000 chars: %s", html_text[:2000])
-        raise RuntimeError("Could not find tsConfigContainer in HTML")
-    raw = html.unescape(match.group(1).strip())
-    if not raw:
-        logger.warning("tsConfigContainer is empty, HTML snippet around it: %s", match.group(0)[:500])
-        raise RuntimeError("tsConfigContainer is empty")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.warning("Failed to parse tsConfigContainer JSON: %s", e)
-        logger.warning("Raw content (first 500 chars): %s", raw[:500])
-        raise
 
 
 def _parse_bootstrap_response(body: str) -> tuple[dict, dict]:
@@ -91,34 +78,105 @@ def _extract_worksheets(info: dict) -> list[str]:
     return names
 
 
-def _bootstrap_via_requests(url: str, proxy_server: str | None = None):
+def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
+    clean_url = url.split("?")[0]
+    tableau_params = {":embed": "y", ":showVizHome": "no"}
+    page_url = clean_url + "?" + urlencode(tableau_params)
+    uri = urlparse(clean_url)
+    host = f"{uri.scheme}://{uri.netloc}"
+
+    bootstrap_url = None
+    cookies_dict = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"]
+        )
+        context_args = {
+            "viewport": {"width": 1920, "height": 1080},
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        }
+        if proxy_server:
+            parsed = urlparse(proxy_server)
+            if parsed.username and parsed.password:
+                context_args["proxy"] = {
+                    "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                    "username": parsed.username,
+                    "password": parsed.password,
+                }
+            else:
+                context_args["proxy"] = {"server": proxy_server}
+
+        context = browser.new_context(**context_args)
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
+
+        page = context.new_page()
+
+        def handle_bootstrap(route):
+            nonlocal bootstrap_url
+            if bootstrap_url is None:
+                bootstrap_url = route.request.url
+                logger.info("[VERBOSE] Intercepted bootstrap URL: %s", bootstrap_url)
+            # ABORT the browser's bootstrap — we'll do it ourselves
+            route.abort()
+
+        page.route(re.compile(r"bootstrapSession"), handle_bootstrap)
+
+        logger.info("Loading page via Playwright (blocking browser bootstrap)...")
+        page.goto(page_url, wait_until="domcontentloaded", timeout=60_000)
+
+        for _ in range(45):
+            if bootstrap_url:
+                break
+            page.wait_for_timeout(1000)
+
+        if not bootstrap_url:
+            raise RuntimeError("No bootstrapSession request intercepted")
+
+        context_cookies = context.cookies()
+        cookies_dict = {c["name"]: c["value"] for c in context_cookies}
+        logger.info("[VERBOSE] Cookies from Playwright: %s", list(cookies_dict.keys()))
+
+        browser.close()
+
+    logger.info("[VERBOSE] Bootstrap URL: %s", bootstrap_url)
+
+    # Extract session ID, vizql_root from the bootstrap URL
+    sess_match = re.search(r"/bootstrapSession/sessions/([^/]+)", bootstrap_url)
+    if not sess_match:
+        raise RuntimeError(f"Could not extract session ID from bootstrap URL: {bootstrap_url}")
+    pre_session_id = sess_match.group(1)
+
+    vizql_match = re.search(r"(/vizql/.*)/bootstrapSession", bootstrap_url)
+    if not vizql_match:
+        raise RuntimeError(f"Could not extract vizql_root from bootstrap URL: {bootstrap_url}")
+    vizql_root = vizql_match.group(1)
+
+    logger.info("[VERBOSE] Pre-bootstrap session ID: %s", pre_session_id)
+    logger.info("[VERBOSE] vizql_root: %s", vizql_root)
+
+    # Now bootstrap from our own requests.Session
     http = requests.Session()
     if proxy_server:
         http.proxies.update({"http": proxy_server, "https": proxy_server})
 
     http.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
+        "Accept": "text/javascript, application/json, */*",
     })
 
-    logger.info("Fetching page HTML to extract tsConfigContainer...")
-    clean_url = url.split("?")[0]
-    tableau_params = {":embed": "y", ":showVizHome": "no"}
-    r = http.get(clean_url, params=tableau_params, timeout=60)
-    r.raise_for_status()
-    logger.info("Page response: %d bytes, status: %d", len(r.content), r.status_code)
+    # Set cookies with proper domain so requests sends them
+    for name, value in cookies_dict.items():
+        http.cookies.set(name, value, domain=".public.tableau.com", path="/")
 
-    ts_config = _extract_ts_config(r.text)
-    vizql_root = ts_config["vizql_root"]
-    pre_session_id = ts_config["sessionid"]
-    sheet_id = ts_config.get("sheetId", "")
-    uri = urlparse(clean_url)
-    host = f"{uri.scheme}://{uri.netloc}"
-    page_url = clean_url + "?" + urlencode(tableau_params)
-
-    logger.info("[VERBOSE] tsConfigContainer sessionid: %s", pre_session_id)
-    logger.info("[VERBOSE] vizql_root: %s", vizql_root)
+    # Extract sheet_id from the bootstrap URL if possible
+    sheet_id_match = re.search(r"/v/([^/]+)", vizql_root)
+    sheet_id = sheet_id_match.group(1) if sheet_id_match else ""
 
     bs_url = f"{host}{vizql_root}/bootstrapSession/sessions/{pre_session_id}"
     bs_payload = {
@@ -135,10 +193,11 @@ def _bootstrap_via_requests(url: str, proxy_server: str | None = None):
             "Origin": host,
             "Referer": page_url,
             "X-Tsi-Active-Tab": sheet_id,
-            "X-XSRF-TOKEN": "null",
         },
         timeout=30,
     )
+    if bs_resp.status_code != 200:
+        logger.warning("Bootstrap POST returned %d: %s", bs_resp.status_code, bs_resp.text[:500])
     bs_resp.raise_for_status()
     logger.info("[VERBOSE] Bootstrap response: %d bytes", len(bs_resp.content))
 
@@ -146,11 +205,10 @@ def _bootstrap_via_requests(url: str, proxy_server: str | None = None):
     dashboard_name = info.get("sheetName", "")
     session_id = info.get("sessionId", pre_session_id)
     ws_names = _extract_worksheets(info)
+    sheet_id_from_info = info.get("sheetId", sheet_id)
 
     logger.info("[VERBOSE] Workbook Info: '%s'", dashboard_name)
     logger.info("[VERBOSE] Worksheets (%d): %s", len(ws_names), ws_names)
-
-    cookies_dict = dict(http.cookies)
 
     return {
         "host": host,
@@ -158,8 +216,8 @@ def _bootstrap_via_requests(url: str, proxy_server: str | None = None):
         "session_id": session_id,
         "dashboard_name": dashboard_name,
         "worksheet_names": ws_names,
-        "cookies": cookies_dict,
-        "active_tab": sheet_id,
+        "cookies": dict(http.cookies),
+        "active_tab": sheet_id_from_info,
         "http": http,
     }
 
@@ -289,10 +347,10 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
     elif proxy_server == "None":
         proxy_server = None
 
-    print("Using requests-based Tableau scraper (no Playwright)...\n")
+    print("Using Playwright + requests hybrid approach...\n")
 
     try:
-        boot = _bootstrap_via_requests(url, proxy_server)
+        boot = _bootstrap_via_playwright(url, proxy_server)
 
         host = boot["host"]
         vizql_root = boot["vizql_root"]
