@@ -5,6 +5,7 @@ import asyncio
 import sys
 import os
 
+# pyrefly: ignore [missing-import]
 from apify import Actor
 from scraper import run
 
