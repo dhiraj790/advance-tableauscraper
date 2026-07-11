@@ -430,7 +430,7 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
         # Filter browser headers to avoid breaking python requests
         safe_headers = {}
         for k, v in boot["browser_headers"].items():
-            if k.lower() not in ["accept-encoding", "content-length", "host", "connection"]:
+            if k.lower() not in ["accept-encoding", "content-length", "host", "connection", "content-type"]:
                 safe_headers[k] = v
         
         http.headers.update(safe_headers)
