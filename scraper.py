@@ -17,7 +17,7 @@ import logging
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
 import pandas as pd
 import requests
@@ -50,9 +50,18 @@ def _extract_ts_config(html_text: str) -> dict:
         html_text, re.DOTALL | re.IGNORECASE
     )
     if not match:
+        logger.warning("tsConfigContainer not found in HTML, first 2000 chars: %s", html_text[:2000])
         raise RuntimeError("Could not find tsConfigContainer in HTML")
     raw = html.unescape(match.group(1).strip())
-    return json.loads(raw)
+    if not raw:
+        logger.warning("tsConfigContainer is empty, HTML snippet around it: %s", match.group(0)[:500])
+        raise RuntimeError("tsConfigContainer is empty")
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning("Failed to parse tsConfigContainer JSON: %s", e)
+        logger.warning("Raw content (first 500 chars): %s", raw[:500])
+        raise
 
 
 def _parse_bootstrap_response(body: str) -> tuple[dict, dict]:
@@ -94,15 +103,19 @@ def _bootstrap_via_requests(url: str, proxy_server: str | None = None):
     })
 
     logger.info("Fetching page HTML to extract tsConfigContainer...")
-    r = http.get(url, params={":embed": "y", ":showVizHome": "no"}, timeout=60)
+    clean_url = url.split("?")[0]
+    tableau_params = {":embed": "y", ":showVizHome": "no"}
+    r = http.get(clean_url, params=tableau_params, timeout=60)
     r.raise_for_status()
+    logger.info("Page response: %d bytes, status: %d", len(r.content), r.status_code)
 
     ts_config = _extract_ts_config(r.text)
     vizql_root = ts_config["vizql_root"]
     pre_session_id = ts_config["sessionid"]
     sheet_id = ts_config.get("sheetId", "")
-    uri = urlparse(url)
+    uri = urlparse(clean_url)
     host = f"{uri.scheme}://{uri.netloc}"
+    page_url = clean_url + "?" + urlencode(tableau_params)
 
     logger.info("[VERBOSE] tsConfigContainer sessionid: %s", pre_session_id)
     logger.info("[VERBOSE] vizql_root: %s", vizql_root)
@@ -120,9 +133,9 @@ def _bootstrap_via_requests(url: str, proxy_server: str | None = None):
             "Accept": "text/javascript",
             "Content-Type": "application/x-www-form-urlencoded",
             "Origin": host,
-            "Referer": url,
+            "Referer": page_url,
             "X-Tsi-Active-Tab": sheet_id,
-            "X-XSRF-TOKEN": http.cookies.get("XSRF-TOKEN", domain=".public.tableau.com") or "null",
+            "X-XSRF-TOKEN": "null",
         },
         timeout=30,
     )
