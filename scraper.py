@@ -32,8 +32,8 @@ from playwright.sync_api import sync_playwright
 
 from config import OUTPUT_DIR, SAMPLE_CSV, URL
 
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger("tableau_scraper")
-
 PAID_PROXY = 'http://groups-RESIDENTIAL:<APIFY_PROXY_PASSWORD>@proxy.apify.com:8000'
 # ── Keywords for address-level worksheet detection ──────────────────
 ADDRESS_KEYWORDS = [
@@ -58,10 +58,10 @@ def _is_address_worksheet(df: pd.DataFrame) -> bool:
 # ────────────────────────────────────────────────────────────────────
 
 def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
-    bootstrap_body: str = ""
-    vizql_version: str = ""
-    ts_config: dict = {}
-    cookies_dict: dict[str, str] = {}
+    bootstrap_req = None
+    bootstrap_resp = None
+    bootstrap_body = ""
+    vizql_version = ""
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -92,8 +92,22 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
         
         page = context.new_page()
 
+        def on_request(request):
+            nonlocal bootstrap_req
+            if "bootstrapSession" in request.url and bootstrap_req is None:
+                bootstrap_req = {
+                    "url": request.url,
+                    "method": request.method,
+                    "headers": request.headers,
+                    "post_data": request.post_data,
+                }
+                logger.info("\n[VERBOSE] Captured bootstrapSession Request:")
+                logger.info("URL: %s", request.url)
+                logger.info("Headers: %s", json.dumps(request.headers, indent=2))
+                logger.info("POST Body: %s\n", request.post_data)
+
         def on_response(response):
-            nonlocal bootstrap_body, vizql_version
+            nonlocal bootstrap_body, vizql_version, bootstrap_resp
             resp_url = response.url
             if not vizql_version:
                 ver_match = re.search(r"/vizql/(v_[^/]+)/", resp_url)
@@ -102,51 +116,47 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
 
             if "bootstrapSession" in resp_url and response.status == 200:
                 try:
+                    logger.info("\n[VERBOSE] Captured bootstrapSession Response Status: %s", response.status)
                     body = response.text()
                     if len(body) > len(bootstrap_body):
                         bootstrap_body = body
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error("Failed to read bootstrap response: %s", e)
 
+        page.on("request", on_request)
         page.on("response", on_response)
 
         logger.info("Loading viz page: %s", url)
-        page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+        # Wait until fully loaded and JS initializes
+        page.goto(url, wait_until="networkidle", timeout=60_000)
 
+        # Wait extra time for bootstrapSession if networkidle fired too early
         for _ in range(45):
-            page.wait_for_timeout(1000)
             if bootstrap_body:
                 page.wait_for_timeout(3000)
                 break
+            page.wait_for_timeout(1000)
 
         if not bootstrap_body:
             raise RuntimeError("No bootstrapSession response captured")
+        if not bootstrap_req:
+            raise RuntimeError("No bootstrapSession request captured")
 
-        raw = page.evaluate("""
-            () => {
-                const el = document.getElementById('tsConfigContainer');
-                return el ? (el.value || el.textContent || '') : '';
-            }
-        """)
-        ts_config = json.loads(raw) if raw and raw.strip() else {}
-
-        if not ts_config:
-            raise RuntimeError("tsConfigContainer is empty")
-
-        vizql_root = ts_config.get("vizql_root", "")
-        session_id = ts_config.get("sessionid", "")
-        active_tab = ts_config.get("sheetId", "")
-
-        if vizql_version and f"/{vizql_version}/" not in vizql_root:
-            vizql_root = vizql_root.replace("/vizql/", f"/vizql/{vizql_version}/", 1)
-
-        worksheet_names: list[str] = []
-        dashboard_name: str = ""
+        # Extract data strictly from bootstrap response body (not tsConfigContainer)
+        dashboard_name = ""
+        worksheet_names = []
+        session_id = ""
+        vizql_root = ""
+        sheet_id = ""
 
         match = re.search(r"\d+;({.*})\d+;({.*})", bootstrap_body, re.MULTILINE)
         if match:
             info = json.loads(match.group(1))
             dashboard_name = info.get("sheetName", "")
+            session_id = info.get("sessionId", "")
+            vizql_root = info.get("vizql_root", "")
+            sheet_id = info.get("sheetId", "")
+            
             world = info.get("worldUpdate", {})
             app_pm = world.get("applicationPresModel", {})
             wb_pm = app_pm.get("workbookPresModel", {})
@@ -156,13 +166,19 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
                 if ws and ws not in worksheet_names:
                     worksheet_names.append(ws)
 
-        if not dashboard_name:
-            dashboard_name = active_tab
+        if not session_id:
+            logger.warning("Could not find sessionId in bootstrap info. Fallback to parsing URL or tsConfig")
+            # Fallback if needed but instructions said extract from it. We'll try.
 
         browser_cookies = context.cookies()
         cookies_dict = {c["name"]: c["value"] for c in browser_cookies}
         
-        if "JSESSIONID" not in cookies_dict:
+        jsessionid = cookies_dict.get("JSESSIONID")
+        logger.info("\n[VERBOSE] JSESSIONID extracted: %s", jsessionid)
+        logger.info("[VERBOSE] VizQL Session ID: %s", session_id)
+        logger.info("[VERBOSE] Extracted cookies: %s\n", cookies_dict.keys())
+        
+        if not jsessionid:
             raise RuntimeError(
                 "Tableau Public failed to issue a JSESSIONID. This usually means "
                 "the server has temporarily rate-limited or blocked this IP from "
@@ -171,6 +187,13 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
             )
 
         browser.close()
+
+    # Reconstruct vizql_root correctly from the URL if missing
+    if not vizql_root:
+        if vizql_version:
+            vizql_root = f"/vizql/{vizql_version}"
+        else:
+            vizql_root = "/vizql/t/public/w/dashboard" # Fallback guess
 
     uri = urlparse(url)
     host = f"{uri.scheme}://{uri.netloc}"
@@ -182,7 +205,8 @@ def _bootstrap_via_playwright(url: str, proxy_server: str | None = None):
         "dashboard_name": dashboard_name,
         "worksheet_names": worksheet_names,
         "cookies": cookies_dict,
-        "active_tab": active_tab,
+        "active_tab": sheet_id,
+        "browser_headers": bootstrap_req["headers"]
     }
 
 
@@ -284,9 +308,16 @@ def export_worksheets(worksheets: dict[str, pd.DataFrame]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for name, df in worksheets.items():
         safe = "".join(c if c.isalnum() or c in "._- " else "_" for c in name)
-        path = OUTPUT_DIR / f"{safe}.csv"
-        df.to_csv(path, index=False, encoding="utf-8-sig")
-        logger.info("Exported '%s' -> %s (%d rows)", name, path, len(df))
+        
+        # CSV Export
+        csv_path = OUTPUT_DIR / f"{safe}.csv"
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        
+        # JSON Export
+        json_path = OUTPUT_DIR / f"{safe}.json"
+        df.to_json(json_path, orient="records", force_ascii=False)
+        
+        logger.info("Exported '%s' -> %s, %s (%d rows)", name, csv_path.name, json_path.name, len(df))
 
 
 def save_sample(df: pd.DataFrame, path: Path = SAMPLE_CSV, n: int = 20) -> None:
@@ -357,8 +388,15 @@ def run(url: str = URL, proxy_server: str | None = None) -> tuple[pd.DataFrame, 
                 "https": proxy_server,
             })
         http.cookies.update(cookies)
+        
+        # Filter browser headers to avoid breaking python requests
+        safe_headers = {}
+        for k, v in boot["browser_headers"].items():
+            if k.lower() not in ["accept-encoding", "content-length", "host", "connection"]:
+                safe_headers[k] = v
+        
+        http.headers.update(safe_headers)
         http.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "application/json, text/javascript, */*",
             "X-Tsi-Active-Tab": active_tab,
         })
